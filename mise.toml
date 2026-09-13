@@ -1,7 +1,7 @@
 [tools]
 pandoc = "latest"
-node = "22"
-hk = "1.57.0"
+hk = "latest"
+node = "latest"
 
 [env]
 _.file = ".env"
