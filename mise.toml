@@ -1,6 +1,6 @@
 [tools]
 pandoc = "latest"
-hk = "latest"
+hk = "2"
 node = "latest"
 
 [env]
