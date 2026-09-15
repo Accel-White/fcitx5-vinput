@@ -1,13 +1,13 @@
 {
-  "id": 25,
-  "timestamp": 1788710985,
+  "id": 26,
+  "timestamp": 1789507947,
   "title": {
     "en_US": "Vinput ≥ 2.3.25 Configuration Migration (vinput config migrate)",
     "zh_CN": "Vinput ≥ 2.3.25 配置迁移（vinput config migrate）"
   },
   "text": {
-    "en_US": "【Target: Upgrading to v2.3.25 or newer】\nConfiguration fields have changed across recent versions. Do not edit config files by hand. Use the built-in migration command (idempotent; originals are copied to backups/ before writing).\n\n▶ Option 1: Fast Reset (if you do not need to keep custom configs)\nRun:\n  vinput init -f\n\n▶ Option 2: In-place migration (recommended; keeps custom configs)\nPreview without writing:\n  vinput config migrate --dry-run\nApply:\n  vinput config migrate\n\n---\n【v2.3.25 Highlights】\n- New `vinput config migrate` command upgrades legacy configs in place with automatic backups.\n- Scene `show_raw` is split into `raw_cand` (candidate list) and `raw_prev` (streaming preview).\n- Resource table README links use the default theme text color with underline.",
-    "zh_CN": "【适用版本：升级到 v2.3.25 及以上版本】\n近期版本对配置字段做了规范化调整。请不要手工改配置文件，使用内置迁移命令（幂等；写入前会把原文件备份到 backups/）。\n\n▶ 方式一：一键重置（无需保留自定义配置）\n在终端执行：\n  vinput init -f\n\n▶ 方式二：原地迁移（推荐，保留已有自定义配置）\n先预览、不写入：\n  vinput config migrate --dry-run\n再执行迁移：\n  vinput config migrate\n\n---\n【v2.3.25 版本说明】\n- 新增 `vinput config migrate`，可原地升级旧版配置并自动备份。\n- 场景 `show_raw` 拆分为 `raw_cand`（候选列表）与 `raw_prev`（流式预览）。\n- 资源页 README 链接改为使用主题默认文字色并加下划线。"
+    "en_US": "【Target: Upgrading to v2.3.25 or newer】\nConfiguration fields have changed across recent versions. Do not edit config files by hand. Use the built-in migration command (idempotent; originals are copied to backups/ before writing).\n\n▶ Option 1: Fast Reset (if you do not need to keep custom configs)\nRun:\n  vinput init -f\n\n▶ Option 2: In-place migration (recommended; keeps custom configs)\nPreview without writing:\n  vinput config migrate --dry-run\nApply:\n  vinput config migrate\n\n---\n【v2.3.26 Highlights】\n- Process safety: verify start time and pin adapters via pidfd before signalling to prevent terminating recycled pids (#213).\n- Idle resource saving: short-circuit context recording when scene context lines are 0, avoiding dead disk I/O and file growth (#209).\n- Native modifier protection: preserve upstream shortcut semantics, add configurable hold delay, and restore Both mode non-modifier hold (#206, #217).\n- Core ASR engine: bump sherpa-onnx to v1.13.8, fixing silent audio hallucinations in FunASR-Nano / Moonshine / Cohere (#218).\n- Robust streaming: preserve raw_prev=false during busy state transitions (#208).\n- Contribution workflow: allow regular pushes to contributor forks and standardize POSIX signal handling (#221, #225).",
+    "zh_CN": "【适用版本：升级到 v2.3.25 及以上版本】\n近期版本对配置字段做了规范化调整。请不要手工改配置文件，使用内置迁移命令（幂等；写入前会把原文件备份到 backups/）。\n\n▶ 方式一：一键重置（无需保留自定义配置）\n在终端执行：\n  vinput init -f\n\n▶ 方式二：原地迁移（推荐，保留已有自定义配置）\n先预览、不写入：\n  vinput config migrate --dry-run\n再执行迁移：\n  vinput config migrate\n\n---\n【v2.3.26 版本说明】\n- 进程安全加固：Adapter 停止时增加进程启动时间校验与 pidfd 句柄锁定，杜绝 PID 复用误杀无关进程 (#213)。\n- 零开销优化：所有场景 context_lines=0 时完全短路打字记录，避免无用磁盘追加与上下文文件无限膨胀 (#209)。\n- 原生修饰键保护：遵循 Fcitx5 原生修饰键保护机制，支持长按触发延迟配置，修复 Both 模式普通键长按行为 (#206, #217)。\n- 核心语音引擎升级：升级 sherpa-onnx 至 v1.13.8，修复 FunASR-Nano / Moonshine / Cohere 等模型在静音下的幻觉输出 (#218)。\n- 流式状态维护：修复繁忙状态切换期间保留 raw_prev=false 设置的问题 (#208)。\n- 贡献工作流优化：修复 pre-push 钩子允许正常推送到 fork 分支，规范引入 POSIX 信号接口 (#221, #225)。"
   },
-  "url": "https://github.com/xifan2333/fcitx5-vinput/releases/tag/v2.3.25"
+  "url": "https://github.com/xifan2333/fcitx5-vinput/releases/tag/v2.3.26"
 }
