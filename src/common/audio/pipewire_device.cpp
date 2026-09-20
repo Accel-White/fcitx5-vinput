@@ -1,12 +1,17 @@
 #include "common/audio/pipewire_device.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <pipewire/keys.h>
+#include <pipewire/main-loop.h>
 #include <pipewire/pipewire.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/dict.h>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -32,11 +37,21 @@ void on_core_done(void* data, uint32_t id, int seq) {
   }
 }
 
+void on_core_error(void* data, uint32_t id, int seq, int res, const char* message) {
+  (void)id;
+  (void)seq;
+  (void)res;
+  (void)message;
+  auto* d = static_cast<PwData*>(data);
+  pw_main_loop_quit(d->loop);
+}
+
 const struct pw_core_events core_events = []() {
   struct pw_core_events ev;
   spa_zero(ev);
   ev.version = PW_VERSION_CORE_EVENTS;
   ev.done = on_core_done;
+  ev.error = on_core_error;
   return ev;
 }();
 
@@ -101,14 +116,12 @@ std::vector<DeviceInfo> EnumerateAudioSources() {
   PwData data{};
   data.loop = pw_main_loop_new(nullptr);
   if (!data.loop) {
-    pw_deinit();
     return {};
   }
 
   data.context = pw_context_new(pw_main_loop_get_loop(data.loop), nullptr, 0);
   if (!data.context) {
     pw_main_loop_destroy(data.loop);
-    pw_deinit();
     return {};
   }
 
@@ -116,7 +129,6 @@ std::vector<DeviceInfo> EnumerateAudioSources() {
   if (!data.core) {
     pw_context_destroy(data.context);
     pw_main_loop_destroy(data.loop);
-    pw_deinit();
     return {};
   }
 
@@ -126,13 +138,29 @@ std::vector<DeviceInfo> EnumerateAudioSources() {
   pw_registry_add_listener(data.registry, &data.registry_listener, &registry_events, &data);
 
   data.pending_sync = pw_core_sync(data.core, PW_ID_CORE, 0);
-  pw_main_loop_run(data.loop);
+  if (data.pending_sync >= 0) {
+    // Arm a 250ms watchdog thread so enumeration never hangs indefinitely.
+    std::atomic<bool> done{false};
+    std::thread watchdog([&done, loop = data.loop]() {
+      const auto start = std::chrono::steady_clock::now();
+      while (!done.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(250)) {
+          pw_main_loop_quit(loop);
+          break;
+        }
+      }
+    });
+
+    pw_main_loop_run(data.loop);
+    done.store(true, std::memory_order_relaxed);
+    watchdog.join();
+  }
 
   pw_proxy_destroy(reinterpret_cast<pw_proxy*>(data.registry));
   pw_core_disconnect(data.core);
   pw_context_destroy(data.context);
   pw_main_loop_destroy(data.loop);
-  pw_deinit();
 
   std::stable_sort(data.devices.begin(), data.devices.end(),
                    [](const DeviceInfo& a, const DeviceInfo& b) {
@@ -145,13 +173,38 @@ std::vector<DeviceInfo> EnumerateAudioSources() {
   return data.devices;
 }
 
-ResolvedCaptureTarget ResolveCaptureTarget(std::string_view target) {
+ResolvedCaptureTarget ResolveCaptureTarget(std::string_view target,
+                                           const std::vector<DeviceInfo>& known_devices) {
   ResolvedCaptureTarget resolved;
   if (target.empty() || target == "default") {
     return resolved;
   }
 
   static constexpr std::string_view kMonitorSuffix = ".monitor";
+
+  // 1. If known devices are provided, prioritize matching against real device metadata.
+  for (const auto& dev : known_devices) {
+    if (dev.name == target) {
+      if (!dev.is_sink_monitor) {
+        // Real Audio/Source node, even if named with a ".monitor" suffix (e.g. clean.monitor).
+        resolved.node_name = dev.name;
+        resolved.is_sink_capture = false;
+        return resolved;
+      }
+
+      // Real Audio/Sink monitor: strip the ".monitor" suffix to target the underlying sink node.
+      if (target.size() > kMonitorSuffix.size() &&
+          target.substr(target.size() - kMonitorSuffix.size()) == kMonitorSuffix) {
+        resolved.node_name = std::string(target.substr(0, target.size() - kMonitorSuffix.size()));
+      } else {
+        resolved.node_name = dev.name;
+      }
+      resolved.is_sink_capture = true;
+      return resolved;
+    }
+  }
+
+  // 2. Fallback heuristic when device is offline or unknown.
   if (target.size() > kMonitorSuffix.size() &&
       target.substr(target.size() - kMonitorSuffix.size()) == kMonitorSuffix) {
     resolved.node_name = std::string(target.substr(0, target.size() - kMonitorSuffix.size()));
