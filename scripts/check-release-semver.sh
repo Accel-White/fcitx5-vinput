@@ -32,6 +32,15 @@ t_major=$((10#${BASH_REMATCH[1]}))
 t_minor=$((10#${BASH_REMATCH[2]}))
 t_patch=$((10#${BASH_REMATCH[3]}))
 
+# Detect shallow repositories early to prevent validating against truncated/stale history
+if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || true)" = "true" ]; then
+  echo "ERROR [semver-guard]: Shallow repository detected. Please run 'git fetch --unshallow --tags' before validating release." >&2
+  exit 1
+fi
+
+# Check if any release tags exist in repository
+all_release_tags="$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" 2>/dev/null || true)"
+
 # Resolve baseline tag excluding target_version itself (prevent self-baselining on tag push)
 last_tag=""
 if [ "${target_ref}" != "HEAD" ]; then
@@ -43,12 +52,35 @@ if [ -z "${last_tag}" ]; then
 fi
 
 if [ -z "${last_tag}" ]; then
-  # Fallback to sorted release tags list
-  last_tag="$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | grep -v -E "^v?${target_version}$" | head -n 1 || true)"
+  # Fallback: scan reachable release tags in version-sorted order
+  for candidate in $(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname); do
+    if [ "${candidate}" = "v${target_version}" ] || [ "${candidate}" = "${target_version}" ]; then
+      continue
+    fi
+    if git merge-base --is-ancestor "${candidate}" "${target_ref}" 2>/dev/null; then
+      last_tag="${candidate}"
+      break
+    fi
+  done
 fi
 
 if [ -z "${last_tag}" ]; then
-  echo "INFO [semver-guard]: No previous release tag found. Initial release allowed: v${target_version}"
+  if [ -n "${all_release_tags}" ]; then
+    tag_commit="$(git rev-parse -q --verify "refs/tags/v${target_version}^{commit}" 2>/dev/null || true)"
+    target_commit="$(git rev-parse -q --verify "${target_ref}^{commit}" 2>/dev/null || true)"
+    if [ -n "${tag_commit}" ] && [ "${tag_commit}" != "${target_commit}" ]; then
+      echo "ERROR [semver-guard]: Tag 'v${target_version}' already exists in repository on a different commit. Cannot re-release existing version." >&2
+      exit 1
+    elif [ -n "${tag_commit}" ] && [ "${all_release_tags}" != "v${target_version}" ]; then
+      echo "ERROR [semver-guard]: Baseline release tag could not be found for 'v${target_version}' despite existing release tags." >&2
+      exit 1
+    elif [ -z "${tag_commit}" ]; then
+      echo "ERROR [semver-guard]: Existing release tags detected, but none are ancestors of ${target_ref}." >&2
+      exit 1
+    fi
+  fi
+
+  echo "INFO [semver-guard]: No previous release tag found in reachable history. Initial release allowed: v${target_version}"
   exit 0
 fi
 
@@ -67,17 +99,46 @@ changed_files="$(git diff "${last_tag}..${target_ref}" --name-only || true)"
 full_commits="$(git log "${last_tag}..${target_ref}" || true)"
 commit_onelines="$(git log "${last_tag}..${target_ref}" --oneline || true)"
 
+# Extract CLI public command, option, flag, and alias tokens from a git ref
+extract_cli_tokens() {
+  local ref="$1"
+  git grep -E -h '(add_subcommand|add_option|add_flag|alias)\s*\(\s*"' "${ref}" -- "src/cli" 2>/dev/null | \
+    sed -E -n 's/.*(add_subcommand|add_option|add_flag|alias)[[:space:]]*\([[:space:]]*"([^",]+)".*/\2/p' | \
+    sort -u
+}
+
+base_cli_tokens=""
+target_cli_tokens=""
+if echo "${changed_files}" | grep -E "^src/cli/" >/dev/null 2>&1; then
+  base_cli_tokens="$(extract_cli_tokens "${last_tag}")"
+  target_cli_tokens="$(extract_cli_tokens "${target_ref}")"
+fi
+
 reasons=()
 required_level="PATCH"
 
 # 1. Check for MAJOR requirements (breaking protocol / breaking changes)
-if echo "${full_commits}" | grep -Ei "BREAKING[ -]CHANGE:|^[a-f0-9]+ [a-z]+(\(.*\))?!:" >/dev/null 2>&1; then
+if echo "${full_commits}" | grep -Ei "BREAKING[ -]CHANGE:" >/dev/null 2>&1 || \
+   echo "${commit_onelines}" | grep -E "^[a-f0-9]+ [a-z]+(\(.*\))?!:" >/dev/null 2>&1; then
   reasons+=("Explicit breaking change syntax detected in commit history (BREAKING CHANGE or feat!:).")
   required_level="MAJOR"
-elif echo "${changed_files}" | grep -E "^(src/common/dbus/dbus_interface\.h|src/daemon/runtime/dbus_service\.cpp)$" >/dev/null 2>&1; then
-  if git diff "${last_tag}..${target_ref}" -- "src/common/dbus/dbus_interface.h" "src/daemon/runtime/dbus_service.cpp" | \
-     grep -E "^\-.*(kMethod|kSignal|SD_BUS_METHOD|SD_BUS_SIGNAL)" >/dev/null 2>&1; then
+elif echo "${changed_files}" | grep -E "^(src/common/dbus/dbus_interface\.h|src/daemon/runtime/dbus_service\.cpp|src/addon/dbus/notifier_dbus_object\.h|src/common/dbus/error_info\.h)$" >/dev/null 2>&1; then
+  if git diff "${last_tag}..${target_ref}" -- \
+     "src/common/dbus/dbus_interface.h" \
+     "src/daemon/runtime/dbus_service.cpp" \
+     "src/addon/dbus/notifier_dbus_object.h" \
+     "src/common/dbus/error_info.h" | \
+     grep -E "^\-.*(kMethod|kSignal|SD_BUS_METHOD|SD_BUS_SIGNAL|FCITX_OBJECT_VTABLE_METHOD|kErrorInfoSignature)" >/dev/null 2>&1; then
     reasons+=("Exported D-Bus method/signal definition removed or modified.")
+    required_level="MAJOR"
+  fi
+fi
+
+if [ "${required_level}" != "MAJOR" ] && [ -n "${base_cli_tokens}" ]; then
+  # Check if existing CLI options, subcommands, or aliases were removed or renamed
+  removed_cli_tokens="$(comm -23 <(echo "${base_cli_tokens}") <(echo "${target_cli_tokens}") | grep -v '^[[:space:]]*$' || true)"
+  if [ -n "${removed_cli_tokens}" ]; then
+    reasons+=("Public CLI subcommand, option, or alias removed or renamed: $(echo ${removed_cli_tokens} | tr '\n' ' ').")
     required_level="MAJOR"
   fi
 fi
@@ -91,20 +152,34 @@ if [ "${required_level}" != "MAJOR" ]; then
   fi
 
   # Rule Y-2: configuration schema or serialization modified
-  if echo "${changed_files}" | grep -E "^(src/common/config/core_config_types\.h|src/common/config/core_config_json\.cpp|data/default-config\.json)$" >/dev/null 2>&1; then
-    reasons+=("Configuration schema modified in core_config_types.h, core_config_json.cpp, or default-config.json.")
+  if echo "${changed_files}" | grep -E "^(src/common/config/core_config_types\.h|src/common/config/core_config_json\.cpp|src/common/config/vinput_config\.h|src/common/config/vinput_config\.cpp|data/default-config\.json)$" >/dev/null 2>&1; then
+    reasons+=("Configuration schema modified in core_config_types.h, core_config_json.cpp, vinput_config.h, vinput_config.cpp, or default-config.json.")
     required_level="MINOR"
   fi
 
-  # Rule Y-3: new subcommands or options added in src/cli/
-  if echo "${changed_files}" | grep -E "^src/cli/" >/dev/null 2>&1; then
-    if git diff "${last_tag}..${target_ref}" -- "src/cli" | grep -E "^\+.*add_subcommand|^\+.*add_option|^\+.*add_flag" >/dev/null 2>&1; then
-      reasons+=("New CLI subcommands or option flags added in src/cli/.")
+  # Rule Y-3: new subcommands, options, or aliases added in src/cli/
+  if [ -n "${target_cli_tokens}" ]; then
+    added_cli_tokens="$(comm -13 <(echo "${base_cli_tokens}") <(echo "${target_cli_tokens}") | grep -v '^[[:space:]]*$' || true)"
+    if [ -n "${added_cli_tokens}" ]; then
+      reasons+=("New CLI subcommands, options, or aliases added in src/cli/: $(echo ${added_cli_tokens} | tr '\n' ' ').")
       required_level="MINOR"
     fi
   fi
 
-  # Rule Y-4: conventional commit feat
+  # Rule Y-4: new exported D-Bus methods or signals added
+  if echo "${changed_files}" | grep -E "^(src/common/dbus/dbus_interface\.h|src/daemon/runtime/dbus_service\.cpp|src/addon/dbus/notifier_dbus_object\.h|src/common/dbus/error_info\.h)$" >/dev/null 2>&1; then
+    if git diff "${last_tag}..${target_ref}" -- \
+       "src/common/dbus/dbus_interface.h" \
+       "src/daemon/runtime/dbus_service.cpp" \
+       "src/addon/dbus/notifier_dbus_object.h" \
+       "src/common/dbus/error_info.h" | \
+       grep -E "^\+.*(kMethod|kSignal|SD_BUS_METHOD|SD_BUS_SIGNAL|FCITX_OBJECT_VTABLE_METHOD)" >/dev/null 2>&1; then
+      reasons+=("New exported D-Bus method or signal definition added.")
+      required_level="MINOR"
+    fi
+  fi
+
+  # Rule Y-5: conventional commit feat
   if echo "${commit_onelines}" | grep -E "^[a-f0-9]+ feat(\(.*\))?:" >/dev/null 2>&1; then
     reasons+=("New feature commit (feat:) detected in commit history.")
     required_level="MINOR"
@@ -119,7 +194,7 @@ case "${required_level}" in
   MAJOR)
     expected_major=$((b_major + 1))
     recommended_version="${expected_major}.0.0"
-    if [ "${t_major}" -le "${b_major}" ] || [ "${t_minor}" -ne 0 ] || [ "${t_patch}" -ne 0 ]; then
+    if [ "${t_major}" -ne "${expected_major}" ] || [ "${t_minor}" -ne 0 ] || [ "${t_patch}" -ne 0 ]; then
       valid=false
     fi
     ;;
@@ -127,11 +202,7 @@ case "${required_level}" in
   MINOR)
     expected_minor=$((b_minor + 1))
     recommended_version="${b_major}.${expected_minor}.0"
-    if [ "${t_major}" -eq "${b_major}" ]; then
-      if [ "${t_minor}" -le "${b_minor}" ] || [ "${t_patch}" -ne 0 ]; then
-        valid=false
-      fi
-    elif [ "${t_major}" -lt "${b_major}" ]; then
+    if [ "${t_major}" -ne "${b_major}" ] || [ "${t_minor}" -ne "${expected_minor}" ] || [ "${t_patch}" -ne 0 ]; then
       valid=false
     fi
     ;;
@@ -139,7 +210,7 @@ case "${required_level}" in
   PATCH)
     expected_patch=$((b_patch + 1))
     recommended_version="${b_major}.${b_minor}.${expected_patch}"
-    if [ "${t_major}" -ne "${b_major}" ] || [ "${t_minor}" -ne "${b_minor}" ] || [ "${t_patch}" -le "${b_patch}" ]; then
+    if [ "${t_major}" -ne "${b_major}" ] || [ "${t_minor}" -ne "${b_minor}" ] || [ "${t_patch}" -ne "${expected_patch}" ]; then
       valid=false
     fi
     ;;
