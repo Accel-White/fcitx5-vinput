@@ -29,6 +29,7 @@ namespace {
 constexpr auto kDefaultClock = 1; // POSIX CLOCK_MONOTONIC
 constexpr auto kReleaseDebounce = std::chrono::milliseconds(500);
 constexpr auto kTriggerDebounce = std::chrono::milliseconds(80);
+constexpr auto kTapMaxHoldDuration = std::chrono::milliseconds(200);
 
 std::string NoSelectionPreeditText() {
   return _("Please select text first.");
@@ -49,18 +50,20 @@ std::string DaemonNotRespondingPreeditText() {
 
 } // namespace
 
-void VinputEngine::cancelInterruptedRecording() {
-  cancelPendingStop();
-  if (modifier_hold_event_ && modifier_hold_event_->isEnabled()) {
-    modifier_hold_event_->setEnabled(false);
+int VinputEngine::matchKeyListIndex(const fcitx::Key& event_key, const fcitx::KeyList& list,
+                                    bool is_release) {
+  const int idx = event_key.keyListIndex(list);
+  if (idx >= 0) {
+    return idx;
   }
-  if (session_ && (session_->phase == Session::Phase::Recording ||
-                   session_->phase == Session::Phase::PendingStart)) {
-    auto* target_ic = session_->ic;
-    callCancelOperation(false);
-    finishFrontendSession(target_ic);
-    clearVoicePresentation(target_ic);
+  if (is_release && event_key.isModifier()) {
+    for (std::size_t i = 0; i < list.size(); ++i) {
+      if (event_key.isReleaseOfModifier(list[i])) {
+        return static_cast<int>(i);
+      }
+    }
   }
+  return -1;
 }
 
 void VinputEngine::startVoiceRecording(fcitx::InputContext* ic, const fcitx::Key& trigger,
@@ -197,317 +200,198 @@ void VinputEngine::handleKeyEvent(fcitx::Event& event) {
     return;
   }
 
-  const auto origKey = keyEvent.origKey().normalize();
-  const bool isModifier = origKey.isModifier();
+  const auto event_key = keyEvent.origKey().normalize();
 
-  // Helper to classify single-modifier actions
-  auto checkModifierAction = [&](const fcitx::Key& k) -> ModifierAction {
-    if (!k.isModifier()) {
-      return ModifierAction::None;
-    }
-    if (k.checkKeyList(trigger_keys_)) {
-      return ModifierAction::Dictation;
-    }
-    if (k.checkKeyList(command_keys_)) {
-      return ModifierAction::Command;
-    }
-    if (k.checkKeyList(menu_keys_)) {
-      return ModifierAction::Menu;
-    }
-    return ModifierAction::None;
-  };
+  // 3. Classify hotkeys using physical sym match (immune to XKB modifier release state bits)
+  const int trigger_index = matchKeyListIndex(event_key, trigger_keys_, keyEvent.isRelease());
+  const bool is_trigger = trigger_index >= 0;
+  const int command_index = matchKeyListIndex(event_key, command_keys_, keyEvent.isRelease());
+  const bool is_command = !is_trigger && command_index >= 0;
+  const int menu_index = matchKeyListIndex(event_key, menu_keys_, keyEvent.isRelease());
+  const bool is_menu = !is_trigger && !is_command && menu_index >= 0;
 
-  const ModifierAction modAction = checkModifierAction(origKey);
-
-  // 3. Key Press Phase
-  if (!keyEvent.isRelease()) {
-    // 3.1 Single-modifier shortcut press
-    if (modAction != ModifierAction::None) {
-      if (keyEvent.rawKey().states().test(fcitx::KeyState::Repeat)) {
-        keyEvent.filter();
-        return;
-      }
-
-      // If already recording in Tap mode, pressing trigger again toggles it off
-      if (session_ &&
-          (session_->phase == Session::Phase::Recording ||
-           session_->phase == Session::Phase::PendingStart) &&
-          session_->trigger_released) {
-        if (session_->phase == Session::Phase::Recording) {
-          finishStopRecording();
-        } else {
-          cancelInterruptedRecording();
-        }
-        keyEvent.filterAndAccept();
-        return;
-      }
-
-      if (modifier_hold_event_ && modifier_hold_event_->isEnabled()) {
-        modifier_hold_event_->setEnabled(false);
-      }
-      pending_modifier_.action = modAction;
-      pending_modifier_.key = origKey;
-      pending_modifier_.press_time = std::chrono::steady_clock::now();
-      pending_modifier_.ic = ic;
-      modifier_hold_active_ = false;
-
-      // Start hold timer for dictation/command if in Hold or Both mode
-      if (modAction != ModifierAction::Menu &&
-          (trigger_mode_ == TriggerMode::Hold || trigger_mode_ == TriggerMode::Both)) {
-        const auto fire_at_usec =
-            fcitx::now(kDefaultClock) +
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(hold_activation_delay_)
-                    .count());
-
-        modifier_hold_event_ = instance_->eventLoop().addTimeEvent(
-            kDefaultClock, fire_at_usec, 0,
-            [this, target_ic = ic, action = modAction, trigger = origKey](auto*, uint64_t) {
-              if (target_ic == nullptr) {
-                pending_modifier_.reset();
-                return false;
-              }
-              modifier_hold_active_ = true;
-              startVoiceRecording(target_ic, trigger, action == ModifierAction::Command);
-              if (session_) {
-                session_->stop_on_release = true;
-              }
-              return false;
-            });
-        modifier_hold_event_->setOneShot();
-      }
-
-      // Pass modifier press through to client to preserve shortcut chords
-      keyEvent.filter();
-      return;
-    }
-
-    // 3.2 The key driving a hold is not an interrupting key. Holding a
-    // non-modifier trigger makes the client repeat the press while the
-    // activation delay runs and while the recording is live, and clients
-    // report those repeats inconsistently: the IBus frontend never sets
-    // KeyState::Repeat. Match the key of the running hold as well, so the
-    // interrupt guard below cannot cancel the recording it just started.
-    if (!isModifier &&
-        (keyEvent.key().keyListIndex(trigger_keys_) >= 0 ||
-         keyEvent.key().keyListIndex(command_keys_) >= 0) &&
-        (keyEvent.rawKey().states().test(fcitx::KeyState::Repeat) ||
-         isPressOfActiveTrigger(keyEvent.key()))) {
-      keyEvent.filterAndAccept();
-      return;
-    }
-
-    // 3.3 Any non-matching key pressed while a modifier is pending or active
-    // This indicates a combination (e.g. Ctrl+C, Alt+Tab, Shift+A). Interrupt and pass through!
-    if (pending_modifier_.action != ModifierAction::None || modifier_hold_active_ ||
-        (session_ && session_->stop_on_release && !session_->trigger_released)) {
-      if (modifier_hold_event_ && modifier_hold_event_->isEnabled()) {
-        modifier_hold_event_->setEnabled(false);
-      }
-      if (modifier_hold_active_ ||
-          (session_ && session_->stop_on_release && !session_->trigger_released)) {
-        cancelInterruptedRecording();
-      }
-      pending_modifier_.reset();
-      modifier_hold_active_ = false;
-      // Let the interrupting key pass through untouched to the client application
-      return;
-    }
-
-    // 3.4 Non-modifier trigger keys (e.g. F8, Pause, etc.)
-    const int trigger_index = !isModifier ? keyEvent.key().keyListIndex(trigger_keys_) : -1;
-    const bool is_trigger = trigger_index >= 0;
-    const int command_index = !isModifier ? keyEvent.key().keyListIndex(command_keys_) : -1;
-    const bool is_command = command_index >= 0;
-
-    if (is_trigger || is_command) {
-      auto now = std::chrono::steady_clock::now();
-      const auto since_last = now - last_trigger_time_;
-      last_trigger_time_ = now;
-      if (since_last < kTriggerDebounce) {
-        keyEvent.filterAndAccept();
-        return;
-      }
-
-      dismissMenusForVoiceActivity();
-      cancelPendingStop();
-
-      if (session_ && session_->phase == Session::Phase::Recording && session_->trigger_released) {
-        finishStopRecording();
-        keyEvent.filterAndAccept();
-        return;
-      }
-      if (session_) {
-        ensureStatusSync();
-        keyEvent.filterAndAccept();
-        return;
-      }
-
-      auto trigger = is_trigger ? trigger_keys_[trigger_index] : command_keys_[command_index];
-
-      if (trigger_mode_ == TriggerMode::Hold) {
-        // A repeat that outlasts the debounce above belongs to the hold that
-        // is already waiting out its activation delay. Restarting the deadline
-        // would push it back on every repeat, so keep the original one. A
-        // press in another context is a new hold: the context that armed the
-        // timer may even be gone by now.
-        if (isPendingStartTrigger(trigger) && pending_start_ic_.get() == ic) {
-          keyEvent.filterAndAccept();
-          return;
-        }
+  // 4. Non-hotkey (regular keys)
+  if (!is_trigger && !is_command && !is_menu) {
+    if (!keyEvent.isRelease()) {
+      // Intervening key breaks any active hotkey into a chord
+      if (held_role_ != HotkeyRole::None) {
+        chord_interrupted_ = true;
         cancelPendingStart();
-        pending_start_trigger_ = trigger;
-        pending_start_ic_ =
-            ic != nullptr ? ic->watch() : fcitx::TrackableObjectReference<fcitx::InputContext>();
-        const auto fire_at_usec =
-            fcitx::now(kDefaultClock) +
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(hold_activation_delay_)
-                    .count());
-        pending_start_event_ = instance_->eventLoop().addTimeEvent(
-            kDefaultClock, fire_at_usec, 0, [this, trigger, is_command](auto*, uint64_t) {
-              auto* target_ic = pending_start_ic_.get();
-              if (target_ic == nullptr) {
-                pending_start_event_.reset();
-                return false;
-              }
-              startVoiceRecording(target_ic, trigger, is_command);
-              if (session_) {
-                session_->stop_on_release = true;
-              }
-              pending_start_event_.reset();
-              return false;
-            });
-        pending_start_event_->setOneShot();
-      } else {
-        startVoiceRecording(ic, trigger, is_command);
-      }
-      keyEvent.filterAndAccept();
-      return;
-    }
 
-    // Check non-modifier command palette shortcut
-    if (!isModifier && handleCommandPaletteHotkey(keyEvent)) {
-      return;
+        // If an optimistic or hold recording is ongoing, discard it immediately
+        if (session_ && session_->stop_on_release && !session_->trigger_released) {
+          auto* target_ic = session_->ic;
+          callCancelOperation(false);
+          finishFrontendSession(target_ic);
+          clearVoicePresentation(target_ic);
+        }
+      }
     }
+    // Pass the non-hotkey untouched to client
+    return;
   }
 
-  // 4. Key Release Phase
-  if (keyEvent.isRelease()) {
-    // 4.1 Single-modifier release (native isReleaseOfModifier disambiguation)
-    if (pending_modifier_.action != ModifierAction::None &&
-        origKey.isReleaseOfModifier(pending_modifier_.key)) {
-      if (modifier_hold_event_ && modifier_hold_event_->isEnabled()) {
-        modifier_hold_event_->setEnabled(false);
+  // 5. Handle Command Palette Hotkey (menu_keys_, e.g. Shift_R)
+  if (is_menu) {
+    if (!keyEvent.isRelease()) {
+      held_key_sym_ = event_key.sym();
+      held_role_ = HotkeyRole::Menu;
+      chord_interrupted_ = false;
+      held_press_time_ = std::chrono::steady_clock::now();
+      // If palette is currently open, swallow press to prevent leaking to app
+      if (palette_menu_visible_) {
+        keyEvent.filterAndAccept();
+        return;
       }
-      const auto action = pending_modifier_.action;
-      const auto trigger_key = pending_modifier_.key;
-      auto* target_ic = pending_modifier_.ic;
-      const bool was_hold = modifier_hold_active_;
-      pending_modifier_.reset();
-      modifier_hold_active_ = false;
+      // If palette is closed, let press pass through so chords like Shift+A work normally
+      return;
+    }
+    // Key Up (Release) phase
+    if (held_role_ == HotkeyRole::Menu && held_key_sym_.has_value() &&
+        *held_key_sym_ == event_key.sym()) {
+      held_role_ = HotkeyRole::None;
+      held_key_sym_.reset();
+      if (!chord_interrupted_) {
+        if (!session_) {
+          toggleCommandPalette(ic);
+        }
+        keyEvent.filterAndAccept();
+        return;
+      }
+    }
+    return;
+  }
 
-      if (target_ic == nullptr) {
-        keyEvent.filter();
+  const auto trigger = is_trigger ? trigger_keys_[trigger_index] : command_keys_[command_index];
+  const auto trigger_mode = *config_.triggerMode;
+
+  // 6. Press Phase
+  if (!keyEvent.isRelease()) {
+    auto now = std::chrono::steady_clock::now();
+    const auto since_last = now - last_trigger_time_;
+    last_trigger_time_ = now;
+    if (since_last < kTriggerDebounce) {
+      keyEvent.filterAndAccept();
+      return;
+    }
+
+    dismissMenusForVoiceActivity();
+    cancelPendingStop();
+
+    // If recording is active and initiated by this trigger:
+    if (session_ && (session_->phase == Session::Phase::Recording ||
+                     session_->phase == Session::Phase::PendingStart)) {
+      if (session_->trigger == trigger) {
+        if (session_->trigger_released) {
+          // Tap toggle: second press stops recording
+          if (session_->phase == Session::Phase::PendingStart) {
+            auto* target_ic = session_->ic;
+            callCancelOperation(false);
+            finishFrontendSession(target_ic);
+            clearVoicePresentation(target_ic);
+          } else {
+            finishStopRecording();
+          }
+        }
+        // If trigger_released is false, this is an auto-repeat while holding: swallow it!
+      } else {
+        // Interrupted by a different trigger key: cancel active recording
+        auto* target_ic = session_->ic;
+        callCancelOperation(false);
+        finishFrontendSession(target_ic);
+        clearVoicePresentation(target_ic);
+      }
+      keyEvent.filterAndAccept();
+      return;
+    }
+
+    // New press
+    held_key_sym_ = event_key.sym();
+    held_role_ = is_trigger ? HotkeyRole::Trigger : HotkeyRole::Command;
+    chord_interrupted_ = false;
+    held_press_time_ = now;
+
+    if (trigger_mode == TriggerMode::Hold || trigger_mode == TriggerMode::Both) {
+      // 0-latency immediate recording start (never swallow first syllable!)
+      startVoiceRecording(ic, trigger, is_command);
+      if (session_) {
+        session_->press_time = now;
+        session_->stop_on_release = true;
+        session_->trigger_released = false;
+      }
+    }
+
+    keyEvent.filterAndAccept();
+    return;
+  }
+
+  // 7. Release Phase
+  if (keyEvent.isRelease()) {
+    const bool matches_active =
+        (held_role_ == HotkeyRole::Trigger || held_role_ == HotkeyRole::Command) &&
+        held_key_sym_.has_value() && *held_key_sym_ == event_key.sym();
+
+    if (matches_active) {
+      held_role_ = HotkeyRole::None;
+      held_key_sym_.reset();
+
+      // If interrupted by another key (e.g. Alt+Tab, Alt+T), release does NOT trigger voice
+      if (chord_interrupted_) {
+        chord_interrupted_ = false;
+        cancelPendingStart();
+        keyEvent.filterAndAccept();
         return;
       }
 
-      if (was_hold) {
-        // Hold mode: stop recording and recognize on release
+      auto now = std::chrono::steady_clock::now();
+      const auto duration = now - held_press_time_;
+
+      if (trigger_mode == TriggerMode::Hold) {
+        // Pure Hold: stop on release
         if (session_ && session_->phase == Session::Phase::Recording) {
-          session_->trigger_released = true;
           scheduleStopRecording();
-        } else if (session_ && session_->phase == Session::Phase::PendingStart) {
-          session_->trigger_released = true;
-          session_->stop_on_release = true;
         }
-      } else {
-        // Tap mode: short press (< hold delay) toggles recording or opens menu
-        if (action == ModifierAction::Menu) {
-          toggleCommandPalette(target_ic);
-        } else if (trigger_mode_ == TriggerMode::Tap || trigger_mode_ == TriggerMode::Both) {
-          startVoiceRecording(target_ic, trigger_key, action == ModifierAction::Command);
+      } else if (trigger_mode == TriggerMode::Tap) {
+        // Pure Tap: toggle on release
+        if (!session_) {
+          startVoiceRecording(ic, trigger, is_command);
+          if (session_) {
+            session_->press_time = now;
+            session_->trigger_released = true;
+            session_->stop_on_release = false;
+          }
+        } else if (session_->phase == Session::Phase::Recording) {
+          scheduleStopRecording();
+        }
+      } else { // TriggerMode::Both
+        if (duration < kTapMaxHoldDuration) {
+          // Short tap (< 200ms): keep recording going continuously!
           if (session_) {
             session_->trigger_released = true;
             session_->stop_on_release = false;
           }
+        } else {
+          // Long hold (>= 200ms): user finished speaking, stop on release!
+          if (session_ && session_->phase == Session::Phase::Recording) {
+            scheduleStopRecording();
+          }
         }
       }
-
-      // Filter and accept the release so clients like Firefox do not toggle their menu bars
-      keyEvent.filterAndAccept();
-      return;
     }
 
-    // Both mode starts non-modifier recordings immediately. Classify the first
-    // release even if startup is pending, so its duration decides whether the
-    // recording should stop once the daemon is ready.
-    if (trigger_mode_ == TriggerMode::Both && session_ && !session_->trigger.isModifier() &&
-        !session_->trigger_released &&
-        (session_->phase == Session::Phase::PendingStart ||
-         session_->phase == Session::Phase::Recording) &&
-        isReleaseOfActiveTrigger(keyEvent.key())) {
-      const auto held = std::chrono::steady_clock::now() - session_->press_time;
+    // Release during active recording
+    if (session_ && session_->trigger == trigger) {
       session_->trigger_released = true;
-      session_->stop_on_release = held >= hold_activation_delay_;
-      if (session_->stop_on_release && session_->phase == Session::Phase::Recording) {
-        scheduleStopRecording();
+      if (session_->stop_on_release) {
+        if (session_->phase == Session::Phase::Recording) {
+          scheduleStopRecording();
+        }
       }
-      keyEvent.filterAndAccept();
-      return;
     }
 
-    // 4.2 Ongoing recording release tracking for hold-to-talk
-    if (session_ && session_->stop_on_release && !session_->trigger_released &&
-        isReleaseOfActiveTrigger(keyEvent.key())) {
-      session_->trigger_released = true;
-      if (session_->phase == Session::Phase::Recording) {
-        scheduleStopRecording();
-      }
-      keyEvent.filterAndAccept();
-      return;
-    }
-
-    // 4.3 Non-modifier trigger release handling
-    const int trigger_index = !isModifier ? keyEvent.key().keyListIndex(trigger_keys_) : -1;
-    const bool is_trigger = trigger_index >= 0;
-    const int command_index = !isModifier ? keyEvent.key().keyListIndex(command_keys_) : -1;
-    const bool is_command = command_index >= 0;
-
-    if (is_trigger || is_command) {
-      // Releasing before the activation delay elapsed is a tap, so the hold
-      // never starts. Only the key that armed the timer may retract it: a
-      // second trigger key pressed meanwhile owns the pending hold now.
-      const auto& released =
-          is_trigger ? trigger_keys_[trigger_index] : command_keys_[command_index];
-      if (trigger_mode_ == TriggerMode::Hold && isPendingStartTrigger(released)) {
-        cancelPendingStart();
-        keyEvent.filterAndAccept();
-        return;
-      }
-      if (session_) {
-        session_->trigger_released = true;
-      }
-      keyEvent.filterAndAccept();
-      return;
-    }
+    keyEvent.filterAndAccept();
+    return;
   }
-}
-
-bool VinputEngine::handleCommandPaletteHotkey(fcitx::KeyEvent& keyEvent) {
-  const auto event_key = keyEvent.key();
-  if (event_key.isModifier() || !event_key.checkKeyList(menu_keys_)) {
-    return false;
-  }
-
-  if (!keyEvent.isRelease()) {
-    if (session_) {
-      return false;
-    }
-    toggleCommandPalette(keyEvent.inputContext());
-  }
-  keyEvent.filterAndAccept();
-  return true;
 }
 
 void VinputEngine::toggleCommandPalette(fcitx::InputContext* ic) {
@@ -522,38 +406,6 @@ void VinputEngine::toggleCommandPalette(fcitx::InputContext* ic) {
     return;
   }
   showPaletteMenu(ic);
-}
-
-bool VinputEngine::isReleaseOfActiveTrigger(const fcitx::Key& key) const {
-  if (!session_) {
-    return false;
-  }
-
-  const auto release_key = key.normalize();
-  const auto trigger_key = session_->trigger.normalize();
-
-  if (trigger_key.isModifier() && release_key.isReleaseOfModifier(trigger_key)) {
-    return true;
-  }
-
-  if (release_key.sym() == trigger_key.sym()) {
-    if (trigger_key.states().toInteger() == 0) {
-      return true;
-    }
-    return release_key.states().testAny(trigger_key.states()) &&
-           (release_key.states() & trigger_key.states()) == trigger_key.states();
-  }
-
-  const auto released_modifier_state = fcitx::Key::keySymToStates(release_key.sym());
-  return released_modifier_state.toInteger() != 0 &&
-         trigger_key.states().testAny(released_modifier_state);
-}
-
-bool VinputEngine::isPressOfActiveTrigger(const fcitx::Key& key) const {
-  if (!session_ || session_->trigger_released || session_->trigger.isModifier()) {
-    return false;
-  }
-  return key.check(session_->trigger);
 }
 
 bool VinputEngine::isPendingStartTrigger(const fcitx::Key& trigger) const {
@@ -573,6 +425,8 @@ void VinputEngine::cancelPendingStart() {
   }
   pending_start_trigger_ = fcitx::Key();
   pending_start_ic_.unwatch();
+  held_role_ = HotkeyRole::None;
+  held_key_sym_.reset();
 }
 
 void VinputEngine::scheduleStopRecording() {

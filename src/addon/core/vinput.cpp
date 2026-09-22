@@ -125,12 +125,8 @@ VinputEngine::VinputEngine(fcitx::Instance* instance) : instance_(instance) {
                                 session_.reset();
                                 polled_idle_since_.reset();
                               }
-                              if (pending_modifier_.ic == ic) {
-                                if (modifier_hold_event_ && modifier_hold_event_->isEnabled()) {
-                                  modifier_hold_event_->setEnabled(false);
-                                }
-                                pending_modifier_.reset();
-                                modifier_hold_active_ = false;
+                              if (pending_start_ic_.get() == ic) {
+                                cancelPendingStart();
                               }
                               if (status_ic_ == ic) {
                                 status_ic_ = nullptr;
@@ -147,6 +143,29 @@ VinputEngine::VinputEngine(fcitx::Instance* instance) : instance_(instance) {
                               }
                               if (context_buffer_ic_ == ic) {
                                 flushContextBuffer();
+                              }
+                            }));
+
+  eventHandlers_.emplace_back(
+      instance_->watchEvent(fcitx::EventType::InputContextFocusOut,
+                            fcitx::EventWatcherPhase::PreInputMethod, [this](fcitx::Event& event) {
+                              if (auto* icEvent = dynamic_cast<fcitx::InputContextEvent*>(&event)) {
+                                auto* ic = icEvent->inputContext();
+                                if (pending_start_ic_.get() == ic) {
+                                  cancelPendingStart();
+                                  chord_interrupted_ = true;
+                                }
+                                held_key_sym_.reset();
+                                held_role_ = HotkeyRole::None;
+                                chord_interrupted_ = true;
+                                if (session_ && session_->ic == ic) {
+                                  if (session_->stop_on_release) {
+                                    callCancelOperation(false);
+                                    finishFrontendSession(ic);
+                                    clearVoicePresentation(ic);
+                                    chord_interrupted_ = true;
+                                  }
+                                }
                               }
                             }));
 
@@ -179,7 +198,6 @@ VinputEngine::~VinputEngine() {
   status_sync_event_.reset();
   pending_stop_event_.reset();
   pending_start_event_.reset();
-  modifier_hold_event_.reset();
 
   pending_stop_call_slot_.reset();
   pending_start_call_slot_.reset();
@@ -222,7 +240,6 @@ void VinputEngine::applySettings() {
   page_next_keys_ = config_.pageNextKeys.value();
   trigger_mode_ = config_.triggerMode.value();
   max_streaming_display_width_ = config_.maxStreamingDisplayWidth.value();
-  hold_activation_delay_ = std::chrono::milliseconds(config_.holdActivationDelay.value());
   reloadSceneConfig();
   reloadPaletteItems();
 }
@@ -400,6 +417,19 @@ void VinputEngine::onCommitString(const std::string& text, fcitx::InputContext* 
     }
   }
   accumulateContextBuffer(text, ic);
+}
+
+bool VinputEngine::isRecordingActive() const {
+  return session_.has_value() && (session_->phase == Session::Phase::Recording ||
+                                  session_->phase == Session::Phase::PendingStart);
+}
+
+bool VinputEngine::isHoldRecording() const {
+  return session_.has_value() && session_->stop_on_release;
+}
+
+bool VinputEngine::isPendingStart() const {
+  return held_role_ == HotkeyRole::Trigger || held_role_ == HotkeyRole::Command;
 }
 
 fcitx::AddonInstance* VinputEngineFactory::create(fcitx::AddonManager* manager) {

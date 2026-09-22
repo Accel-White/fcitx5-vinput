@@ -45,6 +45,12 @@ public:
   void setConfig(const fcitx::RawConfig& config) override;
   void handleKeyEvent(fcitx::Event& event);
 
+  [[nodiscard]] bool isRecordingActive() const;
+  [[nodiscard]] bool isHoldRecording() const;
+  [[nodiscard]] bool isPendingStart() const;
+  [[nodiscard]] static int matchKeyListIndex(const fcitx::Key& event_key,
+                                             const fcitx::KeyList& list, bool is_release);
+
 private:
   void applySettings();
   void reloadSceneConfig();
@@ -53,7 +59,6 @@ private:
   void hidePaletteMenu();
   void resetPaletteMenuState();
   bool handlePaletteMenuKeyEvent(fcitx::KeyEvent& keyEvent);
-  bool handleCommandPaletteHotkey(fcitx::KeyEvent& keyEvent);
   void toggleCommandPalette(fcitx::InputContext* ic);
   void reloadPaletteItems();
   void rebuildPaletteMenu(fcitx::InputContext* ic);
@@ -62,8 +67,6 @@ private:
   void hideResultMenu();
   void resetResultMenuState();
   bool handleResultMenuKeyEvent(fcitx::KeyEvent& keyEvent);
-  bool isReleaseOfActiveTrigger(const fcitx::Key& key) const;
-  bool isPressOfActiveTrigger(const fcitx::Key& key) const;
   bool isPendingStartTrigger(const fcitx::Key& trigger) const;
   void cancelPendingStop();
   void cancelPendingStart();
@@ -147,26 +150,13 @@ private:
   fcitx::KeyList trigger_keys_{fcitx::Key(FcitxKey_Alt_R)};
   fcitx::KeyList command_keys_{fcitx::Key(FcitxKey_Control_R)};
   fcitx::KeyList menu_keys_{fcitx::Key(FcitxKey_Shift_R)};
-  enum class ModifierAction : std::uint8_t { None, Dictation, Command, Menu };
-  struct PendingModifier {
-    ModifierAction action = ModifierAction::None;
-    fcitx::Key key;
-    std::chrono::steady_clock::time_point press_time;
-    fcitx::InputContext* ic = nullptr;
 
-    void reset() {
-      action = ModifierAction::None;
-      key = fcitx::Key();
-      press_time = {};
-      ic = nullptr;
-    }
-  };
-  PendingModifier pending_modifier_;
-  std::unique_ptr<fcitx::EventSourceTime> modifier_hold_event_;
-  bool modifier_hold_active_ = false;
-  std::chrono::milliseconds hold_activation_delay_{300};
+  enum class HotkeyRole : std::uint8_t { None, Menu, Trigger, Command };
+  std::optional<fcitx::KeySym> held_key_sym_;
+  HotkeyRole held_role_ = HotkeyRole::None;
+  bool chord_interrupted_ = false;
+  std::chrono::steady_clock::time_point held_press_time_;
 
-  void cancelInterruptedRecording();
   void startVoiceRecording(fcitx::InputContext* ic, const fcitx::Key& trigger, bool is_command);
 
   fcitx::KeyList page_prev_keys_{
