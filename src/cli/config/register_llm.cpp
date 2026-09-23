@@ -119,8 +119,11 @@ void RegisterAdapterCommands(CLI::App& app, CliAction* action) {
   auto envOverrides = std::make_shared<std::vector<std::string>>();
   auto* add = adapter->add_subcommand("add", _("Add an adapter"));
   add->add_option("id", *selector, _("Adapter short ID"))->required();
-  add->add_option("-e,--env", *envOverrides,
-                  _("Value for a registry-declared env as KEY=VALUE (repeatable)"));
+  // A vector option is greedy: one `-e` absorbs every following bare token, so
+  // interleaved forms such as `-e A=1 cjk-trim -e B=2` lose the adapter ID. Pin
+  // it to a single value per occurrence; repeating `-e` still accumulates.
+  add->add_option("-e,--env", *envOverrides, _("Adapter env var as KEY=VALUE (repeatable)"))
+      ->allow_extra_args(false);
   add->callback([action, selector, envOverrides]() {
     *action = [selector, envOverrides](Formatter& fmt, const CliContext& ctx) {
       return RunLlmConfigInstallAdapter(*selector, *envOverrides, fmt, ctx);

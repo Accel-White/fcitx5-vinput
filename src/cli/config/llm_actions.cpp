@@ -252,7 +252,8 @@ int RunLlmConfigInstallAdapter(const std::string& selector,
   for (const auto& item : envOverrides) {
     const auto sep = item.find('=');
     if (sep == std::string::npos || sep == 0) {
-      fmt.PrintError(vinput::str::FmtStr(_("Invalid --env '%s': expected KEY=VALUE."), item));
+      // A malformed value may be a token pasted without its key, so never echo it back.
+      fmt.PrintError(_("Invalid --env: expected KEY=VALUE."));
       return 1;
     }
     overrides[item.substr(0, sep)] = item.substr(sep + 1);
@@ -307,7 +308,9 @@ int RunLlmConfigInstallAdapter(const std::string& selector,
   }
 
   // The registry can only declare required envs, never default them, so report
-  // the ones still empty instead of saving an adapter that cannot start.
+  // the ones still blank instead of saving an adapter that cannot start. A
+  // whitespace-only value counts as blank: the adapter scripts strip whitespace
+  // before testing the value and then reject it at startup.
   const LlmAdapter* installed = ResolveLlmAdapter(config, it->id);
   if (installed != nullptr) {
     for (const auto& spec : it->envs) {
@@ -315,7 +318,8 @@ int RunLlmConfigInstallAdapter(const std::string& selector,
         continue;
       }
       const auto value = installed->env.find(spec.name);
-      if (value == installed->env.end() || value->second.empty()) {
+      if (value == installed->env.end() ||
+          vinput::str::TrimAsciiWhitespace(value->second).empty()) {
         fmt.PrintWarning(vinput::str::FmtStr(
             _("Required env '%s' is empty; '%s' cannot start until it is set (re-run with -e "
               "%s=<value>)."),
