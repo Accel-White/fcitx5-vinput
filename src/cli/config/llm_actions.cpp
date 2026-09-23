@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <curl/curl.h>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <sys/types.h>
@@ -243,8 +244,20 @@ int RunLlmConfigAdd(const std::string& id, const std::string& baseUrl, const std
   return 0;
 }
 
-int RunLlmConfigInstallAdapter(const std::string& selector, Formatter& fmt, const CliContext& ctx) {
+int RunLlmConfigInstallAdapter(const std::string& selector,
+                               const std::vector<std::string>& envOverrides, Formatter& fmt,
+                               const CliContext& ctx) {
   (void)ctx;
+  std::map<std::string, std::string> overrides;
+  for (const auto& item : envOverrides) {
+    const auto sep = item.find('=');
+    if (sep == std::string::npos || sep == 0) {
+      fmt.PrintError(vinput::str::FmtStr(_("Invalid --env '%s': expected KEY=VALUE."), item));
+      return 1;
+    }
+    overrides[item.substr(0, sep)] = item.substr(sep + 1);
+  }
+
   CoreConfig config = LoadCoreConfig();
   NormalizeCoreConfig(&config);
 
@@ -284,7 +297,7 @@ int RunLlmConfigInstallAdapter(const std::string& selector, Formatter& fmt, cons
     fmt.PrintError(error);
     return 1;
   }
-  if (!vinput::script::MaterializeLlmAdapter(&config, *it, scriptPath, &error)) {
+  if (!vinput::script::MaterializeLlmAdapter(&config, *it, scriptPath, &error, overrides)) {
     fmt.PrintError(error);
     return 1;
   }
