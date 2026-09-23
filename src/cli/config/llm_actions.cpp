@@ -306,6 +306,24 @@ int RunLlmConfigInstallAdapter(const std::string& selector,
     return 1;
   }
 
+  // The registry can only declare required envs, never default them, so report
+  // the ones still empty instead of saving an adapter that cannot start.
+  const LlmAdapter* installed = ResolveLlmAdapter(config, it->id);
+  if (installed != nullptr) {
+    for (const auto& spec : it->envs) {
+      if (!spec.required) {
+        continue;
+      }
+      const auto value = installed->env.find(spec.name);
+      if (value == installed->env.end() || value->second.empty()) {
+        fmt.PrintWarning(vinput::str::FmtStr(
+            _("Required env '%s' is empty; '%s' cannot start until it is set (re-run with -e "
+              "%s=<value>)."),
+            spec.name, selector, spec.name));
+      }
+    }
+  }
+
   fmt.PrintSuccess(vinput::str::FmtStr(_("Adapter '%s' added."), selector));
   return 0;
 }
